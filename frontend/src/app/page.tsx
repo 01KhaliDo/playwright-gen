@@ -140,24 +140,30 @@ export default function HomePage() {
                     <p style={{ color: 'var(--text-dim)', fontSize: '17px', maxWidth: '500px', margin: '0 auto', marginBottom: '24px' }}>
                         Ange en URL — AI:n crawlar sidan och genererar kompletta Playwright-tester åt dig.
                     </p>
-                    <a
-                        href="/test-builder"
-                        style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: '8px',
-                            background: 'var(--accent)',
-                            color: '#fff',
-                            textDecoration: 'none',
-                            padding: '10px 20px',
-                            borderRadius: '8px',
-                            fontWeight: 600,
-                            fontSize: '15px',
-                            transition: 'opacity 0.2s'
-                        }}
-                    >
-                        Prova enkel Test Builder (Steg 2) →
-                    </a>
+                    <div style={{ display: 'inline-flex', gap: '10px', flexWrap: 'wrap', justifyContent: 'center' }}>
+                        <a
+                            href="/test-builder"
+                            style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '8px',
+                                background: 'var(--surface-2)', color: 'var(--text-dim)',
+                                textDecoration: 'none', padding: '10px 20px', borderRadius: '8px',
+                                fontWeight: 600, fontSize: '14px', border: '1px solid var(--border)',
+                            }}
+                        >
+                            Test Builder (enkel) →
+                        </a>
+                        <a
+                            href="/agent"
+                            style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '8px',
+                                background: 'var(--accent)', color: '#fff',
+                                textDecoration: 'none', padding: '10px 20px', borderRadius: '8px',
+                                fontWeight: 600, fontSize: '15px',
+                            }}
+                        >
+                            🤖 Test Agent →
+                        </a>
+                    </div>
                 </div>
 
                 {/* Formulär-fas */}

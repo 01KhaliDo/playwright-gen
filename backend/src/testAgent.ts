@@ -25,7 +25,7 @@ export class TestAgentService {
         this.baseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
     }
 
-    async runAgent(startUrl: string, intent: string, maxSteps = 15): Promise<AgentResult> {
+    async runAgent(startUrl: string, intent: string, maxSteps = 25): Promise<AgentResult> {
         logger.info(`[TestAgent] Starting agent for ${startUrl} -> Intent: ${intent}`);
 
         const browser = await chromium.launch({
@@ -40,45 +40,136 @@ export class TestAgentService {
         const scanner = new ScannerService();
 
         const codeLines: string[] = [];
+        const stepSummary: string[] = [];
+        const failedCodes = new Map<string, number>();
+        const executedCodes = new Set<string>(); // all successfully executed codes — never rolls out
+        let agentCompleted = false;
+        const AGENT_TIMEOUT_MS = 600_000; // 10 minutes
+        const agentStartTime = Date.now();
         codeLines.push(`  await page.goto('${startUrl}');`);
 
         try {
-            await page.goto(startUrl, { waitUntil: 'networkidle', timeout: 30000 });
+            await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
             for (let step = 1; step <= maxSteps; step++) {
-                logger.info(`[TestAgent] Step ${step}/${maxSteps} - Scanning page...`);
-                const scan = await scanner.scanPage(page, startUrl);
+                if (Date.now() - agentStartTime > AGENT_TIMEOUT_MS) {
+                    logger.error('[TestAgent] Agent exceeded total time limit (10 min)');
+                    codeLines.push('  // ERROR: Agent exceeded total time limit');
+                    break;
+                }
+                logger.info(`[TestAgent] ${'─'.repeat(50)}`);
+                logger.info(`[TestAgent] Step ${step}/${maxSteps}  |  ${page.url()}`);
+                const scan = await scanner.scanPage(page, page.url());
+                logger.info(`[TestAgent] Page: "${scan.title}"  |  🔘 ${scan.buttons.length} btn  📝 ${scan.inputs.length} inputs  🔗 ${scan.links.length} links`);
 
-                const prompt = this.buildAgentPrompt(scan, intent, codeLines);
+
+                const prompt = this.buildAgentPrompt(scan, intent, stepSummary);
                 const reply = await this.callOllama(prompt);
 
+                let safeCode = '';
                 try {
                     const actionData = this.parseAgentResponse(reply);
-                    logger.info(`[TestAgent] AI Decision: ${actionData.status} | Thought: ${actionData.thought} | Code: ${actionData.code}`);
+                    const shortThought = actionData.thought.substring(0, 80);
+                    const statusIcon = actionData.status === 'done' ? '🏁' : '🤔';
+                    logger.info(`[TestAgent] ${statusIcon} ${actionData.status.toUpperCase()} — ${shortThought}`);
+                    logger.info(`[TestAgent] 💻 ${actionData.code}`);
 
                     if (actionData.code && actionData.code.trim()) {
-                        codeLines.push(`  ${actionData.code}`);
-                        logger.info(`[TestAgent] Executing: ${actionData.code}`);
-                        const executor = new AsyncFunction('page', 'expect', actionData.code);
+                        // Split multi-action responses into individual statements
+                        const statements = actionData.code
+                            .split(/;\s*(?=await\s)/)
+                            .map((s: string) => s.trim())
+                            .filter((s: string) => s.startsWith('await'));
+
+                        // Pick the best statement from a multi-action response:
+                        // Skip statements that have already failed OR are the same as the last done action.
+                        const lastDone = stepSummary.length > 0
+                            ? (stepSummary[stepSummary.length - 1].split(' → ')[1] || '').replace(/;$/, '').trim()
+                            : '';
+
+                        let chosen = statements[0] || actionData.code.trim();
+                        if (statements.length > 1) {
+                            for (const stmt of statements) {
+                                const normalized = stmt.replace(/;$/, '').trim();
+                                const withSemi = normalized + ';';
+                                const alreadyFailed = (failedCodes.get(withSemi) || 0) >= 1;
+                                const sameAsLastDone = normalized === lastDone;
+                                const alreadyDone = executedCodes.has(normalized);
+                                if (!alreadyFailed && !sameAsLastDone && !alreadyDone) {
+                                    chosen = stmt;
+                                    break;
+                                }
+                            }
+                        }
+                        safeCode = chosen.endsWith(';') ? chosen : chosen + ';';
+
+                        if (statements.length > 1) {
+                            logger.warn(`[TestAgent] ⚠️  Multi-action — picked: ${safeCode}`);
+                        }
+
+                        // Skip actions already successfully executed (uses Set — never rolls out)
+                        const normalizedSafe = safeCode.replace(/;$/, '').trim();
+                        if (executedCodes.has(normalizedSafe)) {
+                            logger.warn(`[TestAgent] ⏭️  Already done — skipping`);
+                            stepSummary.push(`Step ${step}: ⏭️ ALREADY DONE → ${safeCode}`);
+                            continue;
+                        }
+
+                        // Loop detection — same code failed twice → give up
+                        const failCount = failedCodes.get(safeCode) || 0;
+                        if (failCount >= 2) {
+                            logger.error(`[TestAgent] 🔄 Loop detected — "${safeCode}" failed ${failCount} times, stopping`);
+                            codeLines.push(`  // ERROR: Loop detected — same action failed repeatedly`);
+                            break;
+                        }
+
+                        logger.info(`[TestAgent] ▶  ${safeCode}`);
+                        const executor = new AsyncFunction('page', 'expect', safeCode);
                         await executor(page, expect);
-                        await page.waitForTimeout(500);
+                        // Kort paus så att en eventuell navigering hinner starta
+                        await page.waitForTimeout(400);
+                        // Vänta tills sidan är klar — hanterar navigeringar och SPA-uppdateringar
+                        await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+                        await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+                        // Only mark fills as done — clicks can be re-executed (e.g. re-submit after validation fix)
+                        if (!safeCode.includes('.click()')) {
+                            executedCodes.add(normalizedSafe);
+                        }
+                        codeLines.push(`  ${safeCode}`);
+                        logger.info(`[TestAgent] ✅ OK`);
+                        stepSummary.push(`Step ${step}: ✅ ${actionData.thought} → ${safeCode}`);
                     }
 
                     if (actionData.status === 'done') {
-                        logger.info(`[TestAgent] Agent signals DONE!`);
+                        logger.info(`[TestAgent] 🏁 Agent completed!`);
+                        agentCompleted = true;
                         break;
                     }
 
                 } catch (err: any) {
-                    logger.error(`[TestAgent] Step failed: ${err.message}`);
-                    codeLines.push(`  // ERROR: ${err.message}`);
-                    break;
+                    const shortErr = err.message.split('\n')[0].substring(0, 80);
+                    logger.error(`[TestAgent] ❌ ${shortErr}`);
+                    if (safeCode) {
+                        failedCodes.set(safeCode, (failedCodes.get(safeCode) || 0) + 1);
+                    }
+                    codeLines.push(`  // STEP FAILED: ${shortErr}`);
+                    stepSummary.push(`Step ${step}: ❌ FAILED — ${shortErr}`);
+                    continue;
                 }
             }
 
         } finally {
             await browser.close();
         }
+
+        // ─── Sammanfattning ────────────────────────────────────────────────────
+        const succeeded = stepSummary.filter(s => s.includes('✅')).length;
+        const failed    = stepSummary.filter(s => s.includes('❌')).length;
+        const skipped   = stepSummary.filter(s => s.includes('⏭️')).length;
+        logger.info(`[TestAgent] ${'═'.repeat(50)}`);
+        logger.info(`[TestAgent] SUMMARY  ✅ ${succeeded} ok  ❌ ${failed} failed  ⏭️ ${skipped} skipped  |  ${agentCompleted ? '🏁 COMPLETED' : '⚠️  INCOMPLETE'}`);
+        stepSummary.forEach(s => logger.info(`[TestAgent]   ${s}`));
+        logger.info(`[TestAgent] ${'═'.repeat(50)}`);
 
         const testName = intent.replace(/'/g, '').substring(0, 80);
         const finalCode =
@@ -88,7 +179,7 @@ export class TestAgentService {
             `});`;
 
         const validation = TestValidatorService.validate(finalCode);
-        return { success: true, url: startUrl, intent, code: finalCode, validation, iterations: codeLines.length - 1 };
+        return { success: agentCompleted && validation.isValid, url: startUrl, intent, code: finalCode, validation, iterations: codeLines.length - 1 };
     }
 
     // ─── Sanitize locators ─────────────────────────────────────────────────────
@@ -99,36 +190,63 @@ export class TestAgentService {
 
     // ─── Build prompt ──────────────────────────────────────────────────────────
     private buildAgentPrompt(scan: ScanResult, intent: string, history: string[]): string {
-        const historyText = history.length > 1
-            ? history.slice(-5).join('\n')
+        const historyText = history.length > 0
+            ? history.slice(-8).join('\n')
             : '  (none yet)';
 
-        const buttons = scan.buttons.slice(0, 10)
+        const buttons = scan.buttons
+            .filter(b => b.visible && !b.disabled)
+            .slice(0, 10)
             .map(b => `  ${this.sanitizeLocator(b.locator)}  text="${b.text}"`)
             .join('\n') || '  (none)';
 
-        const inputs = scan.inputs.slice(0, 6)
+        const inputs = scan.inputs
+            .filter(i => i.visible)
+            .slice(0, 12)
             .map(i => {
-                const filled = i.currentValue ? ` value="${i.currentValue}"` : '';
-                return `  ${this.sanitizeLocator(i.locator)}  placeholder="${i.placeholder}"${filled}`;
+                const status = i.currentValue
+                    ? ` [ALREADY FILLED: "${i.currentValue}"] — do NOT fill again`
+                    : ' [EMPTY — needs a value]';
+                return `  ${this.sanitizeLocator(i.locator)}  placeholder="${i.placeholder ?? ''}"${status}`;
             })
             .join('\n') || '  (none)';
 
         const links = scan.links
             .filter(l => l.visible)
-            .slice(0, 8)
-            .map(l => `  ${this.sanitizeLocator(l.locator)}  text="${l.text}"`)
+            .slice(0, 12)
+            .map(l => {
+                const href = l.href ? `  href="${l.href.replace(/^https?:\/\/[^/]+/, '')}"` : '';
+                return `  ${this.sanitizeLocator(l.locator)}  text="${l.text}"${href}`;
+            })
             .join('\n') || '  (none)';
+
+        const headings = scan.headings
+            .filter(h => h.visible)
+            .slice(0, 5)
+            .map(h => `  ${h.level}: "${h.text}"`)
+            .join('\n') || '  (none)';
+
+        const errorSection = scan.errorMessages && scan.errorMessages.length > 0
+            ? scan.errorMessages.map(e => `  ⚠️  "${e}"`).join('\n')
+            : null;
 
         return `You are a Playwright test automation agent. You control a live browser step-by-step.
 
 GOAL: ${intent}
 
-CURRENT URL: ${scan.url}
+CURRENT PAGE: ${scan.url}
+PAGE TITLE: "${scan.title}"
 
-PREVIOUS STEPS:
+PAGE HEADINGS (confirms what page you are on):
+${headings}
+
+PREVIOUS STEPS (read carefully — do NOT redo anything marked ✅ or ⏭️):
 ${historyText}
-
+${errorSection ? `
+ERROR MESSAGES ON PAGE (you MUST fix these before doing anything else):
+${errorSection}
+⚠️ There are validation errors — your next action MUST address one of these errors, not proceed with the original goal.
+` : ''}
 VISIBLE ELEMENTS ON PAGE (use these locators exactly):
 Buttons:
 ${buttons}
@@ -137,18 +255,32 @@ ${inputs}
 Links:
 ${links}
 
-Pick the SINGLE next action needed. Think step-by-step:
-1. If there are empty input fields that need values, fill them.
-2. If input fields already have values (value="..."), do NOT fill them again. Click the submit/login button instead.
-3. After login, look for new buttons/links to continue toward the goal.
-4. Do NOT repeat an action that appears in PREVIOUS STEPS.
-5. Copy-paste locators EXACTLY from the list above. Do NOT modify, combine, or extend them.
-   FORBIDDEN: .filter(), .has(), .locator() chaining, or any method not shown in the element list.
-6. Use single quotes inside code strings.
+BEFORE YOU PICK AN ACTION — ask yourself: "Is the GOAL already fully achieved?"
+If yes, return status="done" immediately with an assertion. Do NOT do extra steps beyond the goal.
 
-Respond with ONLY this JSON:
+Pick the SINGLE next action needed. Think step-by-step:
+1. Read PREVIOUS STEPS first — they tell you exactly what has already been done and where you are now.
+   If PREVIOUS STEPS show ✅ login actions, you ARE logged in — do NOT try to log in again.
+   Only navigate to a different page if the GOAL requires something that cannot be done on the CURRENT PAGE.
+2. Fill ONLY fields explicitly mentioned in the GOAL — do NOT fill other empty fields on the page.
+3. NEVER fill inputs marked [ALREADY FILLED]. Move to the next required field or click submit.
+4. Do NOT repeat an action marked ✅ or ⏭️ in PREVIOUS STEPS.
+5. CRITICAL: Use ONLY locators from VISIBLE ELEMENTS above. NEVER invent or guess locators.
+   FORBIDDEN: .filter(), .has(), custom IDs or classes not listed above.
+6. CRITICAL: Return EXACTLY ONE await statement in code. Never chain or combine multiple actions.
+   WRONG: "await a.click(); await b.fill('x');"
+   RIGHT: "await a.click();"
+7. Use single quotes inside code strings.
+8. When the goal is fully achieved, return status="done" with a Playwright assertion that proves it.
+   Examples of done assertions:
+   - Navigation succeeded:  await expect(page).toHaveURL('/inventory.html');
+   - Element appeared:      await expect(page.getByRole('heading', { name: 'Products' })).toBeVisible();
+   - Text visible:          await expect(page.getByText('Welcome back')).toBeVisible();
+
+Respond with ONLY this JSON (no markdown, no explanation):
 {"thought":"reason for action","status":"in-progress","code":"await page.locator('#my-button').click();"}
-When done: {"thought":"done","status":"done","code":""}`;    }
+When goal is achieved:
+{"thought":"explain what was verified","status":"done","code":"await expect(page).toHaveURL('/expected-path');"}`;    }
 
     // ─── Parse AI response ─────────────────────────────────────────────────────
     private parseAgentResponse(raw: string): { thought: string, status: string, code: string } {
@@ -168,12 +300,39 @@ When done: {"thought":"done","status":"done","code":""}`;    }
         }
         if (last === -1) throw new Error('No closing brace found in AI response');
 
-        // Pre-sanitize: { name: "Login" } → { name: 'Login' }
-        const jsonStr = cleaned.substring(first, last + 1)
-            .replace(/,\s*\{\s*(\w+):\s*"([^"]*)"\s*\}/g, ", { $1: '$2' }")
-            .replace(/\{\s*(\w+):\s*"([^"]*)"\s*,/g, "{ $1: '$2',");
+        let jsonStr = cleaned.substring(first, last + 1);
 
-        const parsed = JSON.parse(jsonStr);
+        // Attempt 1: direct parse
+        try {
+            const parsed = JSON.parse(jsonStr);
+            return this.extractFields(parsed);
+        } catch {}
+
+        // Attempt 2: repair common AI JSON mistakes
+        jsonStr = jsonStr
+            .replace(/\\([^"\\\/bfnrtu])/g, '$1') // remove invalid escape sequences e.g. \s \( \.
+            .replace(/\\\//g, '/')                  // \/ → /
+            .replace(/,\s*([\}\]])/g, '$1');        // trailing commas
+
+        try {
+            const parsed = JSON.parse(jsonStr);
+            return this.extractFields(parsed);
+        } catch {}
+
+        // Attempt 3: regex extract each field individually
+        const status = (cleaned.match(/"status"\s*:\s*"(in-progress|done)"/) || [])[1] || 'in-progress';
+        const thought = (cleaned.match(/"thought"\s*:\s*"([^"]*)"/) || [])[1] || '';
+        const codeMatch = cleaned.match(/"code"\s*:\s*"([\s\S]*?)(?<!\\)"\s*[,\}]/);
+        const code = codeMatch ? codeMatch[1].replace(/\\"/g, '"').trim() : '';
+
+        if (!code && status === 'in-progress') {
+            throw new Error(`Failed to parse AI response: ${cleaned.substring(0, 200)}`);
+        }
+
+        return { thought, status, code };
+    }
+
+    private extractFields(parsed: any): { thought: string, status: string, code: string } {
         return {
             thought: parsed.thought || '',
             status:  parsed.status  || 'in-progress',
@@ -181,8 +340,40 @@ When done: {"thought":"done","status":"done","code":""}`;    }
         };
     }
 
-    // ─── Ollama ────────────────────────────────────────────────────────────────
+    // ─── AI call — priority: DeepSeek → Groq → Ollama (local)
     private async callOllama(prompt: string): Promise<string> {
+        if (process.env.DEEPSEEK_API_KEY) {
+            const response = await fetch('https://api.deepseek.com/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+                },
+                body: JSON.stringify({
+                    model: 'deepseek-chat',
+                    messages: [{ role: 'user', content: prompt }],
+                    temperature: 0.0,
+                }),
+            });
+            if (!response.ok) {
+                const err = await response.text();
+                throw new Error(`DeepSeek API error: ${response.status} ${err}`);
+            }
+            const data = await response.json() as any;
+            return data.choices[0].message.content || '';
+        }
+
+        if (process.env.GROQ_API_KEY) {
+            const Groq = require('groq-sdk');
+            const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+            const response = await groq.chat.completions.create({
+                model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+                messages: [{ role: 'user', content: prompt }],
+                temperature: 0.0,
+            });
+            return response.choices[0].message.content || '';
+        }
+
         const ollama = new Ollama({ host: this.baseUrl });
         const response = await ollama.chat({
             model: this.model,

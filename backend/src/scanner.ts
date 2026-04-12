@@ -72,6 +72,17 @@ export interface HeadingInfo {
     visible: boolean;
 }
 
+export interface AccessibleNode {
+    role: string;
+    name: string;
+    locator: string;
+    value?: string;
+    disabled?: boolean;
+    required?: boolean;
+    checked?: boolean;
+    level?: number;
+}
+
 export interface ScanResult {
     url: string;
     title: string;
@@ -80,6 +91,8 @@ export interface ScanResult {
     forms: FormInfo[];
     links: LinkInfo[];
     headings: HeadingInfo[];
+    accessibilityNodes: AccessibleNode[];
+    errorMessages: string[];
     scannedAt: string;
 }
 
@@ -125,21 +138,46 @@ export class ScannerService {
      * Detta används framförallt av Agent-loopen som håller webbläsaren vid liv.
      */
     async scanPage(page: any, url: string): Promise<ScanResult> {
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await page.waitForTimeout(800);
+        // Vänta tills sidan är klar — hanterar både vanliga sidor och SPA-navigeringar
+        await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+        // Kort extra buffer för SPA-ramverk (React/Vue/Angular) som renderar efter nätverket
+        await page.waitForTimeout(300);
 
-        const [title, buttons, inputs, forms, links, headings] = await Promise.all([
-            page.title(),
-            this.extractButtons(page),
-            this.extractInputs(page),
-            this.extractForms(page),
-            this.extractLinks(page),
-            this.extractHeadings(page),
-        ]);
+        // Retry-loop: om sidan navigerar mitt i skanningen försöker vi en gång till
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                const [title, buttons, inputs, forms, links, headings, errorMessages] = await Promise.all([
+                    page.title(),
+                    this.extractButtons(page),
+                    this.extractInputs(page),
+                    this.extractForms(page),
+                    this.extractLinks(page),
+                    this.extractHeadings(page),
+                    this.extractErrorMessages(page),
+                ]);
 
-        logger.info(`Scanner done: ${buttons.length} buttons, ${inputs.length} inputs, ${forms.length} forms, ${links.length} links, ${headings.length} headings`);
+                if (errorMessages.length > 0) {
+                    logger.warn(`Scanner: ${errorMessages.length} error message(s) on page: ${errorMessages.join(' | ')}`);
+                }
+                logger.info(`Scanner done: ${buttons.length} buttons, ${inputs.length} inputs, ${forms.length} forms, ${links.length} links, ${headings.length} headings`);
 
-        return { url, title, buttons, inputs, forms, links, headings, scannedAt: new Date().toISOString() };
+                return { url, title, buttons, inputs, forms, links, headings, accessibilityNodes: [], errorMessages, scannedAt: new Date().toISOString() };
+
+            } catch (err: any) {
+                const isNavError = err.message.includes('context was destroyed') || err.message.includes('navigation');
+                if (attempt === 0 && isNavError) {
+                    logger.warn(`Scanner: navigering detekterad under skanning — försöker igen...`);
+                    await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+                    await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+                    await page.waitForTimeout(500);
+                    continue;
+                }
+                throw err;
+            }
+        }
+
+        throw new Error('Scanner: misslyckades efter retry');
     }    /**
      * Skannar flera URL:er i samma browser-session och slår ihop resultaten till ett ScanResult.
      * Primär URL/titel tas från den första URL:en.
@@ -163,6 +201,8 @@ export class ScannerService {
             forms: [],
             links: [],
             headings: [],
+            accessibilityNodes: [],
+            errorMessages: [],
             scannedAt: new Date().toISOString(),
         };
 
@@ -189,13 +229,14 @@ export class ScannerService {
                     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
                     await page.waitForTimeout(500);
 
-                    const [title, buttons, inputs, forms, links, headings] = await Promise.all([
+                    const [title, buttons, inputs, forms, links, headings, errorMessages] = await Promise.all([
                         page.title(),
                         this.extractButtons(page),
                         this.extractInputs(page),
                         this.extractForms(page),
                         this.extractLinks(page),
                         this.extractHeadings(page),
+                        this.extractErrorMessages(page),
                     ]);
 
                     if (i === 0) merged.title = title;
@@ -212,6 +253,7 @@ export class ScannerService {
                     merged.forms.push(...forms);
                     merged.links.push(...links);
                     merged.headings.push(...headings);
+                    merged.errorMessages.push(...errorMessages);
 
                     logger.info(`Scanner [${i + 1}/${urls.length}] ${url}: ${buttons.length} buttons, ${inputs.length} inputs`);
                     await page.close();
@@ -447,17 +489,87 @@ export class ScannerService {
             }
 
             const results: any[] = [];
+            const seenTexts = new Set<string>();
 
             document.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach((el: any) => {
                 const text = el.textContent?.trim() || '';
                 const level = el.tagName.toLowerCase();
                 const visible = isVisible(el);
-                if (text) {
+                if (text && !seenTexts.has(text)) {
+                    seenTexts.add(text);
                     results.push({ text, level, visible });
                 }
+            });
+
+            // Capture common page-title patterns used by frameworks that skip <h> tags
+            // e.g. saucedemo uses <span class="title">Products</span>
+            const pageTitleSelectors = [
+                '[class="title"]',
+                '[class="page-title"]',
+                '[class="page-heading"]',
+                '[class="section-title"]',
+                '[class="app_logo"]',
+            ];
+            pageTitleSelectors.forEach(sel => {
+                document.querySelectorAll(sel).forEach((el: any) => {
+                    const text = el.textContent?.trim() || '';
+                    if (text && !seenTexts.has(text) && isVisible(el)) {
+                        seenTexts.add(text);
+                        results.push({ text, level: 'page-title', visible: true });
+                    }
+                });
             });
 
             return results;
         });
     }
+
+    private async extractErrorMessages(page: any): Promise<string[]> {
+        return page.evaluate(() => {
+            const ERROR_KEYWORDS = [
+                'invalid', 'required', 'error', 'incorrect', 'wrong',
+                'failed', 'fel', 'ogiltigt', 'saknas', 'krävs', 'obligatorisk',
+                'must', 'cannot', 'not found', 'unauthorized', 'forbidden',
+            ];
+
+            const selectors = [
+                '[role="alert"]',
+                '[class*="error"]:not(script):not(style)',
+                '[class*="invalid"]:not(script):not(style)',
+                '[class*="validation"]:not(script):not(style)',
+                '.invalid-feedback',
+                '.field-error',
+                '.form-error',
+                '.text-danger',
+                '[class*="warning"]:not(script):not(style)',
+            ];
+
+            const seen = new Set<string>();
+            const results: string[] = [];
+
+            selectors.forEach(selector => {
+                document.querySelectorAll(selector).forEach((el: any) => {
+                    const text = el.textContent?.trim();
+                    if (!text || text.length < 3 || text.length > 200) return;
+
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width === 0 && rect.height === 0) return;
+
+                    const looksLikeError = ERROR_KEYWORDS.some(kw => text.toLowerCase().includes(kw));
+                    if (!looksLikeError) return;
+
+                    if (!seen.has(text)) {
+                        seen.add(text);
+                        results.push(text);
+                    }
+                });
+            });
+
+            return results.slice(0, 10);
+        });
+    }
+
 }

@@ -1,23 +1,15 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from '@playwright/test'; 
 
-use: {
-  video: 'on'
-}
-test('Login and checkout', async ({ page }) => { 
-  await page.goto('https://www.saucedemo.com/');
-  await page.getByPlaceholder('Username').fill('standard_user');
-  await page.getByPlaceholder('Password').fill('secret_sauce');
-  await page.getByRole('button', { name: 'Login' }).click();
-  await page.getByRole('button', { name: 'Add to cart' }).click();
-  await page.getByRole('button', { name: 'Add to cart' }).click();
-  await page.getByRole('button', { name: 'View cart' }).click();
-  await expect(page.getByRole('heading', { name: 'Your cart' })).toBeVisible();
-  await page.getByRole('button', { name: 'Checkout' }).click();
-  await page.getByPlaceholder('First name').fill('John');
-  await page.getByPlaceholder('Last name').fill('Doe');
-  await page.getByPlaceholder('Postal code').fill('12345');
-  await page.getByRole('button', { name: 'Continue' }).click();
-  await expect(page.getByRole('heading', { name: 'Checkout - Order summary' })).toBeVisible();
-  await page.getByRole('button', { name: 'Cancel' }).click();
-  await expect(page.getByRole('heading', { name: 'Products' })).toBeVisible();
+  test.use({ video: 'on' });
+
+test('OrangeHRM login and PIM search', async ({ page }) => {
+  await page.goto('https://opensource-demo.orangehrmlive.com/web/index.php/auth/login');
+  await page.getByPlaceholder('Username').fill('Admin');
+    await page.getByPlaceholder('Password').fill('admin123');
+    await page.getByRole('button', { name: 'Login' }).click();
+    await page.getByRole('link', { name: 'PIM' }).click();
+    await page.getByPlaceholder('Search').fill('Admin');
+    await page.getByRole('button', { name: 'Search' }).click();
+    await expect(page.getByRole('link', { name: 'Admin'})).toBeVisible();
 });
+

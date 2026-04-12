@@ -127,25 +127,30 @@ export default function TestBuilderPage() {
                     <p style={{ color: 'var(--text-dim)', fontSize: '17px', maxWidth: '500px', margin: '0 auto', marginBottom: '24px' }}>
                         Steg 2: Skapa ett enskilt test utifrån ett specifikt mål (intent).
                     </p>
-                    <a
-                        href="/"
-                        style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: '8px',
-                            background: 'var(--surface-2)',
-                            color: 'var(--text-dim)',
-                            textDecoration: 'none',
-                            padding: '10px 20px',
-                            borderRadius: '8px',
-                            fontWeight: 600,
-                            fontSize: '14px',
-                            border: '1px solid var(--border)',
-                            transition: 'all 0.2s'
-                        }}
-                    >
-                        ← Tillbaka till Full Generator
-                    </a>
+                    <div style={{ display: 'inline-flex', gap: '10px', flexWrap: 'wrap', justifyContent: 'center' }}>
+                        <a
+                            href="/"
+                            style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '8px',
+                                background: 'var(--surface-2)', color: 'var(--text-dim)',
+                                textDecoration: 'none', padding: '10px 20px', borderRadius: '8px',
+                                fontWeight: 600, fontSize: '14px', border: '1px solid var(--border)',
+                            }}
+                        >
+                            ← Full Generator
+                        </a>
+                        <a
+                            href="/agent"
+                            style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '8px',
+                                background: 'var(--accent)', color: '#fff',
+                                textDecoration: 'none', padding: '10px 20px', borderRadius: '8px',
+                                fontWeight: 600, fontSize: '14px',
+                            }}
+                        >
+                            🤖 Prova Test Agent →
+                        </a>
+                    </div>
                 </div>
 
                 {/* Formulär-fas */}

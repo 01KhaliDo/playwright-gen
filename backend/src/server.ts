@@ -360,28 +360,6 @@ app.get('/api/download/:runId', async (req, res) => {
     logger.info(`ZIP downloaded for runId: ${runId}`);
 });
 
-// ---------------------------------------------------------------------------
-// GET /api/generate-agentic?url=...&intent=...
-// Agentic loop — steg-för-steg testgenerering med live webbläsare
-// ---------------------------------------------------------------------------
-app.get('/api/generate-agentic', async (req, res) => {
-    const url = req.query.url as string;
-    const intent = req.query.intent as string;
-
-    if (!url || !intent) {
-        return res.status(400).json({ error: 'Both url and intent are required' });
-    }
-
-    try {
-        logger.info(`[generate-agentic] Starting Agent for ${url} with intent="${intent}"`);
-        const agent = new TestAgentService();
-        const result = await agent.runAgent(url, intent);
-        res.json(result);
-    } catch (err: any) {
-        logger.error(`[generate-agentic] Failed: ${err.message}`);
-        res.status(500).json({ error: err.message });
-    }
-});
 
 // ---------------------------------------------------------------------------
 // Starta servern
