@@ -3,6 +3,10 @@ import { expect } from '@playwright/test';
 import { Ollama } from 'ollama';
 import { ScannerService, ScanResult } from './scanner';
 import { logger } from './logger';
+import * as fs from 'fs';
+import * as path from 'path';
+
+const AUTH_FILE = path.join(__dirname, '..', 'auth.json');
 import { TestValidatorService } from './testValidator';
 
 const AsyncFunction = Object.getPrototypeOf(async function () { }).constructor;
@@ -32,9 +36,15 @@ export class TestAgentService {
             headless: true,
             args: ['--no-sandbox', '--disable-setuid-sandbox']
         });
+
+        const hasAuth = fs.existsSync(AUTH_FILE);
+        if (hasAuth) logger.info('[TestAgent] 🔑 Loading saved session from auth.json');
+
         const context = await browser.newContext({
             viewport: { width: 1280, height: 720 },
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 TestAgent/1.0',
+            ignoreHTTPSErrors: true,
+            ...(hasAuth ? { storageState: AUTH_FILE } : {}),
         });
         const page = await context.newPage();
         const scanner = new ScannerService();
@@ -46,10 +56,32 @@ export class TestAgentService {
         let agentCompleted = false;
         const AGENT_TIMEOUT_MS = 600_000; // 10 minutes
         const agentStartTime = Date.now();
-        codeLines.push(`  await page.goto('${startUrl}');`);
+
+        // Läs sparad post-login URL om den finns
+        const authMetaFile = AUTH_FILE + '.meta.json';
+        let navigateUrl = startUrl;
+        if (hasAuth && fs.existsSync(authMetaFile)) {
+            try {
+                const meta = JSON.parse(fs.readFileSync(authMetaFile, 'utf8'));
+                if (meta.postLoginUrl) {
+                    navigateUrl = meta.postLoginUrl;
+                    logger.info(`[TestAgent] 🔑 Navigating directly to post-login URL: ${navigateUrl}`);
+                }
+            } catch { /* ignore */ }
+        }
+
+        codeLines.push(`  await page.goto('${navigateUrl}');`);
 
         try {
-            await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(navigateUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+            // Om auth finns men vi hamnar på login-sidan — sessionen har gått ut, ta bort auth
+            if (hasAuth && page.url().includes('login.')) {
+                logger.warn('[TestAgent] ⚠️ Session expired — deleting auth.json and restarting login');
+                try { fs.unlinkSync(AUTH_FILE); } catch { /* ignore */ }
+                try { fs.unlinkSync(authMetaFile); } catch { /* ignore */ }
+                await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            }
 
             for (let step = 1; step <= maxSteps; step++) {
                 if (Date.now() - agentStartTime > AGENT_TIMEOUT_MS) {
@@ -61,7 +93,9 @@ export class TestAgentService {
                 logger.info(`[TestAgent] Step ${step}/${maxSteps}  |  ${page.url()}`);
                 const scan = await scanner.scanPage(page, page.url());
                 logger.info(`[TestAgent] Page: "${scan.title}"  |  🔘 ${scan.buttons.length} btn  📝 ${scan.inputs.length} inputs  🔗 ${scan.links.length} links`);
-
+                if (scan.links.length > 0) {
+                    logger.info(`[TestAgent] 🔗 Links: ${scan.links.filter(l => l.visible).map(l => `"${l.text}"`).join(', ')}`);
+                }
 
                 const prompt = this.buildAgentPrompt(scan, intent, stepSummary);
                 const reply = await this.callOllama(prompt);
@@ -103,13 +137,20 @@ export class TestAgentService {
                         }
                         safeCode = chosen.endsWith(';') ? chosen : chosen + ';';
 
+                        // Fix AI mistake: locator('a', { name: 'X' }) → locator('a', { hasText: 'X' })
+                        safeCode = safeCode.replace(
+                            /locator\(([^,]+),\s*\{\s*name:\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*\}\)/g,
+                            'locator($1, { hasText: $2 })'
+                        );
+
                         if (statements.length > 1) {
                             logger.warn(`[TestAgent] ⚠️  Multi-action — picked: ${safeCode}`);
                         }
 
                         // Skip actions already successfully executed (uses Set — never rolls out)
                         const normalizedSafe = safeCode.replace(/;$/, '').trim();
-                        if (executedCodes.has(normalizedSafe)) {
+                        const execKey = safeCode.includes('.click()') ? `${page.url()}|${normalizedSafe}` : normalizedSafe;
+                        if (executedCodes.has(execKey)) {
                             logger.warn(`[TestAgent] ⏭️  Already done — skipping`);
                             stepSummary.push(`Step ${step}: ⏭️ ALREADY DONE → ${safeCode}`);
                             continue;
@@ -125,14 +166,89 @@ export class TestAgentService {
 
                         logger.info(`[TestAgent] ▶  ${safeCode}`);
                         const executor = new AsyncFunction('page', 'expect', safeCode);
-                        await executor(page, expect);
+                        try {
+                            await executor(page, expect);
+                        } catch (clickErr: any) {
+                            // Strict mode violation → retry with .first()
+                            if (clickErr.message.includes('strict mode violation') && safeCode.includes('.click()')) {
+                                logger.warn(`[TestAgent] ⚠️ Strict mode — retrying with .first()`);
+                                const firstCode = safeCode.replace(/\.click\(/, '.first().click(');
+                                const firstExecutor = new AsyncFunction('page', 'expect', firstCode);
+                                await firstExecutor(page, expect);
+                                safeCode = firstCode; // save the working version
+                                logger.info(`[TestAgent] ✅ .first() click OK`);
+                            // Timeout on a click → retry with DOM text search click
+                            } else if (clickErr.message.includes('Timeout') && safeCode.includes('.click()')) {
+                                logger.warn(`[TestAgent] ⏱ Click timeout — retrying via DOM text search`);
+                                const nameMatch = safeCode.match(/name:\s*['"]([^'"]+)['"]/) || safeCode.match(/hasText:\s*['"]([^'"]+)['"]/);
+                                const searchText = nameMatch?.[1] || '';
+                                let domClickOk = false;
+                                if (searchText) {
+                                    try {
+                                        const domClickCode = `await page.evaluate((text) => {
+    const el = Array.from(document.querySelectorAll('a, button, [role="button"]'))
+        .find(function(e) { return e.textContent && e.textContent.trim() === text; });
+    if (el) el.click();
+    else throw new Error('Element not found: ' + text);
+}, '${searchText}');`;
+                                        const domExecutor = new AsyncFunction('page', 'expect', domClickCode);
+                                        await domExecutor(page, expect);
+                                        logger.info(`[TestAgent] ✅ DOM text click OK`);
+                                        safeCode = domClickCode;  // spara rätt kod
+                                        domClickOk = true;
+                                    } catch (_domErr) {
+                                        logger.warn(`[TestAgent] DOM click failed — trying href navigation`);
+                                    }
+                                }
+                                if (!domClickOk) {
+                                    const linkText = searchText || '';
+                                    const href = linkText ? await page.evaluate((text: string) => {
+                                        const link = Array.from(document.querySelectorAll('a'))
+                                            .find(a => a.textContent?.trim() === text);
+                                        return link ? (link as HTMLAnchorElement).href : null;
+                                    }, linkText) : null;
+                                    if (href && !href.endsWith('#')) {
+                                        logger.warn(`[TestAgent] 🔗 Navigating directly to: ${href}`);
+                                        await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                                        logger.info(`[TestAgent] ✅ href navigation OK`);
+                                    } else {
+                                        throw clickErr;
+                                    }
+                                }
+                            // fill() on a <select> → retry with selectOption()
+                            } else if (clickErr.message.includes('not an <input>') && safeCode.includes('.fill(')) {
+                                logger.warn(`[TestAgent] ⚠️ fill() on select — retrying with selectOption()`);
+                                const fillMatch = safeCode.match(/\.fill\('([^']+)'\)/) || safeCode.match(/\.fill\("([^"]+)"\)/);
+                                const fillValue = fillMatch ? fillMatch[1] : '';
+                                const selectCode = safeCode.replace(/\.fill\(['"][^'"]+['"]\)/, `.selectOption({ label: '${fillValue}' })`);
+                                const selectExecutor = new AsyncFunction('page', 'expect', selectCode);
+                                await selectExecutor(page, expect);
+                                logger.info(`[TestAgent] ✅ selectOption OK`);
+                            } else {
+                                throw clickErr;
+                            }
+                        }
                         // Kort paus så att en eventuell navigering hinner starta
-                        await page.waitForTimeout(400);
+                        await page.waitForTimeout(1000);
+                        // Spara session automatiskt efter inloggning (när vi lämnar login-sidan)
+                        if (!hasAuth && !page.url().includes('login.') && page.url() !== startUrl) {
+                            await context.storageState({ path: AUTH_FILE });
+                            fs.writeFileSync(authMetaFile, JSON.stringify({ postLoginUrl: page.url() }), 'utf8');
+                            logger.info(`[TestAgent] 💾 Session sparad — post-login URL: ${page.url()}`);
+                        }
                         // Vänta tills sidan är klar — hanterar navigeringar och SPA-uppdateringar
                         await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
                         await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
-                        // Only mark fills as done — clicks can be re-executed (e.g. re-submit after validation fix)
-                        if (!safeCode.includes('.click()')) {
+                        // Ta bort modal-backdrop om den finns kvar (blockerar annars klick)
+                        await page.evaluate(() => {
+                            document.querySelectorAll('.modal-backdrop, [class*="backdrop"]').forEach(el => (el as HTMLElement).remove());
+                            document.body.style.overflow = '';
+                            document.body.classList.remove('modal-open');
+                        }).catch(() => {});
+                        // Track all actions — include URL in key for clicks so same click on different pages is allowed
+                        if (safeCode.includes('.click()')) {
+                            executedCodes.add(`${page.url()}|${normalizedSafe}`);
+                        } else {
                             executedCodes.add(normalizedSafe);
                         }
                         codeLines.push(`  ${safeCode}`);
@@ -183,9 +299,10 @@ export class TestAgentService {
     }
 
     // ─── Sanitize locators ─────────────────────────────────────────────────────
-    // Replaces href="/cart.html" → href='/cart.html' so the AI doesn't break JSON
+    // Keeps double quotes inside attribute selectors so they don't conflict with
+    // the outer single quotes in page.locator('...') — e.g. [name="city-select"]
     private sanitizeLocator(locator: string): string {
-        return locator.replace(/="([^"]*)"/g, "='$1'");
+        return locator; // Keep as-is — double quotes inside single-quoted strings are valid JS
     }
 
     // ─── Build prompt ──────────────────────────────────────────────────────────
@@ -207,6 +324,10 @@ export class TestAgentService {
                 const status = i.currentValue
                     ? ` [ALREADY FILLED: "${i.currentValue}"] — do NOT fill again`
                     : ' [EMPTY — needs a value]';
+                if (i.tag === 'select') {
+                    const opts = i.options && i.options.length > 0 ? ` options=[${i.options.slice(0, 5).map(o => `"${o}"`).join(', ')}]` : '';
+                    return `  ${this.sanitizeLocator(i.locator)}  [SELECT DROPDOWN — use .selectOption("label") NOT .fill()]${opts}${status}`;
+                }
                 return `  ${this.sanitizeLocator(i.locator)}  placeholder="${i.placeholder ?? ''}"${status}`;
             })
             .join('\n') || '  (none)';
@@ -230,6 +351,14 @@ export class TestAgentService {
             ? scan.errorMessages.map(e => `  ⚠️  "${e}"`).join('\n')
             : null;
 
+        const modalSection = scan.modal?.detected
+            ? `MODAL/POPUP BLOCKING THE PAGE:
+  Title: "${scan.modal.title ?? 'unknown'}"
+  Close locator: ${scan.modal.closeLocator ?? '(no close button found)'}
+🚨 A modal is open and blocking the page. You MUST close it before doing ANYTHING else.
+   Your ONLY next action is: ${scan.modal.closeLocator ? `await ${scan.modal.closeLocator}.click();` : 'press Escape: await page.keyboard.press("Escape");'}`
+            : null;
+
         return `You are a Playwright test automation agent. You control a live browser step-by-step.
 
 GOAL: ${intent}
@@ -242,18 +371,22 @@ ${headings}
 
 PREVIOUS STEPS (read carefully — do NOT redo anything marked ✅ or ⏭️):
 ${historyText}
-${errorSection ? `
+${modalSection ? `
+${modalSection}
+` : ''}${errorSection ? `
 ERROR MESSAGES ON PAGE (you MUST fix these before doing anything else):
 ${errorSection}
 ⚠️ There are validation errors — your next action MUST address one of these errors, not proceed with the original goal.
 ` : ''}
-VISIBLE ELEMENTS ON PAGE (use these locators exactly):
+VISIBLE ELEMENTS ON PAGE (use these locators EXACTLY as shown — do NOT invent your own):
 Buttons:
 ${buttons}
 Inputs:
 ${inputs}
-Links:
+Links (clickable — use the exact locator shown, NEVER use getByRole('button') for these):
 ${links}
+
+⚠️ LOCATOR RULE: Copy the locator character-for-character from the list above. If 'Spara' appears under Links, use its Links locator — NOT getByRole('button', ...) or getByRole('link', ...).
 
 BEFORE YOU PICK AN ACTION — ask yourself: "Is the GOAL already fully achieved?"
 If yes, return status="done" immediately with an assertion. Do NOT do extra steps beyond the goal.

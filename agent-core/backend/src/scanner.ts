@@ -28,6 +28,7 @@ export interface ButtonInfo {
 }
 
 export interface InputInfo {
+    tag: string;
     name: string | null;
     type: string | null;
     placeholder: string | null;
@@ -38,6 +39,7 @@ export interface InputInfo {
     visible: boolean;
     locator: string;
     currentValue: string | null;
+    options?: string[];
 }
 
 export interface FormField {
@@ -83,6 +85,12 @@ export interface AccessibleNode {
     level?: number;
 }
 
+export interface ModalInfo {
+    detected: boolean;
+    title: string | null;
+    closeLocator: string | null;
+}
+
 export interface ScanResult {
     url: string;
     title: string;
@@ -93,6 +101,7 @@ export interface ScanResult {
     headings: HeadingInfo[];
     accessibilityNodes: AccessibleNode[];
     errorMessages: string[];
+    modal: ModalInfo;
     scannedAt: string;
 }
 
@@ -147,7 +156,7 @@ export class ScannerService {
         // Retry-loop: om sidan navigerar mitt i skanningen försöker vi en gång till
         for (let attempt = 0; attempt < 2; attempt++) {
             try {
-                const [title, buttons, inputs, forms, links, headings, errorMessages] = await Promise.all([
+                const [title, buttons, inputs, forms, links, headings, errorMessages, modal] = await Promise.all([
                     page.title(),
                     this.extractButtons(page),
                     this.extractInputs(page),
@@ -155,14 +164,18 @@ export class ScannerService {
                     this.extractLinks(page),
                     this.extractHeadings(page),
                     this.extractErrorMessages(page),
+                    this.extractModal(page),
                 ]);
 
                 if (errorMessages.length > 0) {
                     logger.warn(`Scanner: ${errorMessages.length} error message(s) on page: ${errorMessages.join(' | ')}`);
                 }
+                if (modal.detected) {
+                    logger.warn(`Scanner: modal detected — "${modal.title}" | close: ${modal.closeLocator}`);
+                }
                 logger.info(`Scanner done: ${buttons.length} buttons, ${inputs.length} inputs, ${forms.length} forms, ${links.length} links, ${headings.length} headings`);
 
-                return { url, title, buttons, inputs, forms, links, headings, accessibilityNodes: [], errorMessages, scannedAt: new Date().toISOString() };
+                return { url, title, buttons, inputs, forms, links, headings, accessibilityNodes: [], errorMessages, modal, scannedAt: new Date().toISOString() };
 
             } catch (err: any) {
                 const isNavError = err.message.includes('context was destroyed') || err.message.includes('navigation');
@@ -203,6 +216,7 @@ export class ScannerService {
             headings: [],
             accessibilityNodes: [],
             errorMessages: [],
+            modal: { detected: false, title: null, closeLocator: null },
             scannedAt: new Date().toISOString(),
         };
 
@@ -386,8 +400,19 @@ export class ScannerService {
                     locator = `page.locator('${el.tagName.toLowerCase()}')`;
                 }
 
+                const tag = el.tagName.toLowerCase();
                 const currentValue = (el.type === 'password') ? (el.value ? '[hidden]' : '') : (el.value || null);
-                results.push({ name, type, placeholder, ariaLabel, label, id, disabled, visible, locator, currentValue });
+
+                // För select-element, samla ihop tillgängliga alternativ
+                let options: string[] | undefined;
+                if (tag === 'select') {
+                    options = Array.from(el.options as HTMLOptionsCollection)
+                        .slice(0, 10)
+                        .map((o: any) => o.text?.trim())
+                        .filter(Boolean);
+                }
+
+                results.push({ tag, name, type, placeholder, ariaLabel, label, id, disabled, visible, locator, currentValue, options });
             });
 
             return results.slice(0, 40);
@@ -451,8 +476,24 @@ export class ScannerService {
                 if (seen.has(key)) return;
                 seen.add(key);
 
+                const ariaHidden = el.getAttribute('aria-hidden') === 'true';
+
                 let locator: string;
-                if (ariaLabel) {
+                if (ariaHidden && id) {
+                    locator = `page.locator('#${id}')`;
+                } else if (ariaHidden) {
+                    // aria-hidden elements are invisible to getByRole
+                    const relHref = el.getAttribute('href');
+                    if (relHref && relHref !== '#' && relHref !== '') {
+                        // Real path — use href + :visible
+                        locator = `page.locator('a[href="${relHref}"]:visible')`;
+                    } else if (text && text.length < 40) {
+                        // href="#" or empty — use text content instead
+                        locator = `page.locator('a', { hasText: '${text}' }).first()`;
+                    } else {
+                        locator = `page.locator('a[href="${relHref}"]:visible')`;
+                    }
+                } else if (ariaLabel) {
                     locator = `page.getByRole('link', { name: '${ariaLabel}' })`;
                 } else if (dataTestId) {
                     locator = `page.getByTestId('${dataTestId}')`;
@@ -521,6 +562,81 @@ export class ScannerService {
             });
 
             return results;
+        });
+    }
+
+    private async extractModal(page: any): Promise<ModalInfo> {
+        return page.evaluate(() => {
+            function isVisible(el: Element): boolean {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 && rect.height === 0) return false;
+                const style = window.getComputedStyle(el);
+                return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+            }
+
+            // Find visible modal/dialog
+            const modalSelectors = [
+                '[role="dialog"]',
+                '[aria-modal="true"]',
+                '.modal[style*="display: block"]',
+                '.modal.show',
+                '.modal.open',
+                '.modal.active',
+                '.dialog',
+                '.overlay',
+            ];
+
+            let modalEl: Element | null = null;
+            for (const sel of modalSelectors) {
+                const el = document.querySelector(sel);
+                if (el && isVisible(el)) { modalEl = el; break; }
+            }
+
+            if (!modalEl) return { detected: false, title: null, closeLocator: null };
+
+            // Find title inside modal
+            const titleEl = modalEl.querySelector('h1, h2, h3, h4, [class*="title"], [class*="header"]');
+            const title = titleEl?.textContent?.trim() || null;
+
+            // Find close button inside modal
+            const closeSelectors = [
+                '[aria-label="Close"]',
+                '[aria-label="close"]',
+                '[aria-label="Stäng"]',
+                '[aria-label="stäng"]',
+                'button[class*="close"]',
+                'button[class*="dismiss"]',
+                '.close',
+                '.btn-close',
+                '[data-dismiss="modal"]',
+                '[data-bs-dismiss="modal"]',
+            ];
+
+            // Build a CSS selector for the modal itself so we can scope the close button to it
+            let modalSelector = '[role="dialog"]';
+            if ((modalEl as HTMLElement).getAttribute('aria-modal') === 'true') {
+                modalSelector = '[aria-modal="true"]';
+            }
+
+            let closeLocator: string | null = null;
+            for (const sel of closeSelectors) {
+                const btn = modalEl.querySelector(sel) as HTMLElement | null;
+                if (btn && isVisible(btn)) {
+                    const ariaLabel = btn.getAttribute('aria-label');
+                    const text = btn.textContent?.trim();
+                    if (ariaLabel) {
+                        closeLocator = `page.locator('${modalSelector}').getByRole('button', { name: '${ariaLabel}' }).first()`;
+                    } else if (text && text.length < 30) {
+                        closeLocator = `page.locator('${modalSelector}').getByRole('button', { name: '${text}' }).first()`;
+                    } else {
+                        closeLocator = `page.locator('${modalSelector} ${sel}').first()`;
+                    }
+                    break;
+                }
+            }
+
+            return { detected: true, title, closeLocator };
         });
     }
 

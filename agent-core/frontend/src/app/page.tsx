@@ -49,6 +49,8 @@ export default function AgentPage() {
     const [result, setResult] = useState<AgentResult | null>(null);
     const [errorMsg, setErrorMsg] = useState('');
     const [copySuccess, setCopySuccess] = useState(false);
+    const [runStatus, setRunStatus] = useState<'idle' | 'running' | 'passed' | 'failed'>('idle');
+    const [runOutput, setRunOutput] = useState('');
     const [elapsed, setElapsed] = useState(0);
     const [loadingMsgIdx, setLoadingMsgIdx] = useState(0);
     const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -130,6 +132,25 @@ export default function AgentPage() {
         URL.revokeObjectURL(downloadUrl);
     };
 
+    const handleRunTest = async () => {
+        if (!result) return;
+        setRunStatus('running');
+        setRunOutput('');
+        try {
+            const response = await fetch(`${BACKEND}/api/run-test`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code: result.code }),
+            });
+            const data = await response.json();
+            setRunStatus(data.passed ? 'passed' : 'failed');
+            setRunOutput(data.output || '');
+        } catch (err: any) {
+            setRunStatus('failed');
+            setRunOutput(err.message || 'Kunde inte köra testet');
+        }
+    };
+
     const handleReset = () => {
         setPhase('form');
         setResult(null);
@@ -137,6 +158,8 @@ export default function AgentPage() {
         setUrl('');
         setIntent('');
         setCopySuccess(false);
+        setRunStatus('idle');
+        setRunOutput('');
     };
 
     return (
@@ -305,6 +328,18 @@ export default function AgentPage() {
                             </div>
 
                             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                                <button
+                                    onClick={handleRunTest}
+                                    className="btn btn-primary"
+                                    disabled={runStatus === 'running'}
+                                    style={{
+                                        background: runStatus === 'passed' ? 'var(--green)' : runStatus === 'failed' ? 'var(--red)' : undefined,
+                                        color: (runStatus === 'passed' || runStatus === 'failed') ? '#fff' : undefined,
+                                        opacity: runStatus === 'running' ? 0.7 : 1,
+                                    }}
+                                >
+                                    {runStatus === 'running' ? '⏳ Kör...' : runStatus === 'passed' ? '✅ Godkänd' : runStatus === 'failed' ? '❌ Misslyckad' : '▶ Kör test'}
+                                </button>
                                 <button onClick={handleDownload} className="btn btn-primary">
                                     💾 Ladda ner
                                 </button>
@@ -343,6 +378,33 @@ export default function AgentPage() {
                                 ))}
                             </code>
                         </div>
+
+                        {/* Testkörningsresultat */}
+                        {(runStatus === 'running' || runOutput) && (
+                            <div style={{
+                                marginTop: '20px',
+                                padding: '16px',
+                                background: runStatus === 'passed' ? 'rgba(52,211,153,0.07)' : runStatus === 'failed' ? 'rgba(248,113,113,0.07)' : 'var(--surface-2)',
+                                border: `1px solid ${runStatus === 'passed' ? 'var(--green)' : runStatus === 'failed' ? 'var(--red)' : 'var(--border)'}`,
+                                borderRadius: '8px',
+                            }}>
+                                <h4 style={{
+                                    fontSize: '13px', fontWeight: 600, marginBottom: '10px',
+                                    color: runStatus === 'passed' ? 'var(--green)' : runStatus === 'failed' ? 'var(--red)' : 'var(--text-dim)',
+                                }}>
+                                    {runStatus === 'running' ? '⏳ Kör test...' : runStatus === 'passed' ? '✅ Testet godkänt' : '❌ Testet misslyckades'}
+                                </h4>
+                                {runOutput && (
+                                    <pre style={{
+                                        margin: 0, fontSize: '12px', fontFamily: 'JetBrains Mono, monospace',
+                                        color: 'var(--text-dim)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                        maxHeight: '300px', overflowY: 'auto',
+                                    }}>
+                                        {runOutput}
+                                    </pre>
+                                )}
+                            </div>
+                        )}
 
                         {/* Valideringsmeddelanden */}
                         {result.validation && (result.validation.errors.length > 0 || result.validation.warnings.length > 0) && (
