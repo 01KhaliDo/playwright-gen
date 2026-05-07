@@ -3,10 +3,6 @@ import { expect } from '@playwright/test';
 import { Ollama } from 'ollama';
 import { ScannerService, ScanResult } from './scanner';
 import { logger } from './logger';
-import * as fs from 'fs';
-import * as path from 'path';
-
-const AUTH_FILE = path.join(__dirname, '..', 'auth.json');
 import { TestValidatorService } from './testValidator';
 
 const AsyncFunction = Object.getPrototypeOf(async function () { }).constructor;
@@ -37,14 +33,10 @@ export class TestAgentService {
             args: ['--no-sandbox', '--disable-setuid-sandbox']
         });
 
-        const hasAuth = fs.existsSync(AUTH_FILE);
-        if (hasAuth) logger.info('[TestAgent] 🔑 Loading saved session from auth.json');
-
         const context = await browser.newContext({
             viewport: { width: 1280, height: 720 },
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 TestAgent/1.0',
             ignoreHTTPSErrors: true,
-            ...(hasAuth ? { storageState: AUTH_FILE } : {}),
         });
         const page = await context.newPage();
         const scanner = new ScannerService();
@@ -53,35 +45,17 @@ export class TestAgentService {
         const stepSummary: string[] = [];
         const failedCodes = new Map<string, number>();
         const executedCodes = new Set<string>(); // all successfully executed codes — never rolls out
+        let lastExecKey: string | null = null;   // last click key — cleared when modal invalidates it
         let agentCompleted = false;
         const AGENT_TIMEOUT_MS = 600_000; // 10 minutes
         const agentStartTime = Date.now();
 
-        // Läs sparad post-login URL om den finns
-        const authMetaFile = AUTH_FILE + '.meta.json';
-        let navigateUrl = startUrl;
-        if (hasAuth && fs.existsSync(authMetaFile)) {
-            try {
-                const meta = JSON.parse(fs.readFileSync(authMetaFile, 'utf8'));
-                if (meta.postLoginUrl) {
-                    navigateUrl = meta.postLoginUrl;
-                    logger.info(`[TestAgent] 🔑 Navigating directly to post-login URL: ${navigateUrl}`);
-                }
-            } catch { /* ignore */ }
-        }
-
-        codeLines.push(`  await page.goto('${navigateUrl}');`);
+        codeLines.push(`  await page.goto('${startUrl}');`);
 
         try {
-            await page.goto(navigateUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-            // Om auth finns men vi hamnar på login-sidan — sessionen har gått ut, ta bort auth
-            if (hasAuth && page.url().includes('login.')) {
-                logger.warn('[TestAgent] ⚠️ Session expired — deleting auth.json and restarting login');
-                try { fs.unlinkSync(AUTH_FILE); } catch { /* ignore */ }
-                try { fs.unlinkSync(authMetaFile); } catch { /* ignore */ }
-                await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            }
+            const effectiveIntent = intent;
 
             for (let step = 1; step <= maxSteps; step++) {
                 if (Date.now() - agentStartTime > AGENT_TIMEOUT_MS) {
@@ -92,12 +66,26 @@ export class TestAgentService {
                 logger.info(`[TestAgent] ${'─'.repeat(50)}`);
                 logger.info(`[TestAgent] Step ${step}/${maxSteps}  |  ${page.url()}`);
                 const scan = await scanner.scanPage(page, page.url());
+                // If a modal is open: un-mark last click AND any previous dialog-close actions
+                if (scan.modal?.detected) {
+                    if (lastExecKey) {
+                        executedCodes.delete(lastExecKey);
+                        logger.warn(`[TestAgent] 🔄 Modal opened by last click — allowing retry after modal close`);
+                        lastExecKey = null;
+                    }
+                    for (const key of [...executedCodes]) {
+                        if (key.includes('[role="dialog"]')) {
+                            executedCodes.delete(key);
+                            logger.warn(`[TestAgent] 🔄 Un-marking previous dialog action — allowing retry`);
+                        }
+                    }
+                }
                 logger.info(`[TestAgent] Page: "${scan.title}"  |  🔘 ${scan.buttons.length} btn  📝 ${scan.inputs.length} inputs  🔗 ${scan.links.length} links`);
                 if (scan.links.length > 0) {
                     logger.info(`[TestAgent] 🔗 Links: ${scan.links.filter(l => l.visible).map(l => `"${l.text}"`).join(', ')}`);
                 }
 
-                const prompt = this.buildAgentPrompt(scan, intent, stepSummary);
+                const prompt = this.buildAgentPrompt(scan, effectiveIntent, stepSummary);
                 const reply = await this.callOllama(prompt);
 
                 let safeCode = '';
@@ -141,6 +129,11 @@ export class TestAgentService {
                         safeCode = safeCode.replace(
                             /locator\(([^,]+),\s*\{\s*name:\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*\}\)/g,
                             'locator($1, { hasText: $2 })'
+                        );
+                        // Fix toHaveURL with relative path → use RegExp so it matches full URL
+                        safeCode = safeCode.replace(
+                            /toHaveURL\('(\/[^']*)'\)/g,
+                            (_, path) => `toHaveURL(new RegExp('${path.replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&')}'))`
                         );
 
                         if (statements.length > 1) {
@@ -230,12 +223,6 @@ export class TestAgentService {
                         }
                         // Kort paus så att en eventuell navigering hinner starta
                         await page.waitForTimeout(1000);
-                        // Spara session automatiskt efter inloggning (när vi lämnar login-sidan)
-                        if (!hasAuth && !page.url().includes('login.') && page.url() !== startUrl) {
-                            await context.storageState({ path: AUTH_FILE });
-                            fs.writeFileSync(authMetaFile, JSON.stringify({ postLoginUrl: page.url() }), 'utf8');
-                            logger.info(`[TestAgent] 💾 Session sparad — post-login URL: ${page.url()}`);
-                        }
                         // Vänta tills sidan är klar — hanterar navigeringar och SPA-uppdateringar
                         await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
                         await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
@@ -247,9 +234,12 @@ export class TestAgentService {
                         }).catch(() => {});
                         // Track all actions — include URL in key for clicks so same click on different pages is allowed
                         if (safeCode.includes('.click()')) {
-                            executedCodes.add(`${page.url()}|${normalizedSafe}`);
+                            const ek = `${page.url()}|${normalizedSafe}`;
+                            executedCodes.add(ek);
+                            lastExecKey = ek;
                         } else {
                             executedCodes.add(normalizedSafe);
+                            lastExecKey = null;
                         }
                         codeLines.push(`  ${safeCode}`);
                         logger.info(`[TestAgent] ✅ OK`);
@@ -351,12 +341,17 @@ export class TestAgentService {
             ? scan.errorMessages.map(e => `  ⚠️  "${e}"`).join('\n')
             : null;
 
+        const modalActionLines = scan.modal?.actionButtons?.length
+            ? scan.modal.actionButtons.map(b => `    - "${b.text}": await ${b.locator}.click();`).join('\n')
+            : null;
         const modalSection = scan.modal?.detected
             ? `MODAL/POPUP BLOCKING THE PAGE:
   Title: "${scan.modal.title ?? 'unknown'}"
-  Close locator: ${scan.modal.closeLocator ?? '(no close button found)'}
-🚨 A modal is open and blocking the page. You MUST close it before doing ANYTHING else.
-   Your ONLY next action is: ${scan.modal.closeLocator ? `await ${scan.modal.closeLocator}.click();` : 'press Escape: await page.keyboard.press("Escape");'}`
+  Close (dismiss): ${scan.modal.closeLocator ? `await ${scan.modal.closeLocator}.click();` : 'await page.keyboard.press("Escape");'}
+${modalActionLines ? `  Action buttons (may navigate somewhere useful):\n${modalActionLines}\n` : ''}🚨 A modal is open. ${modalActionLines
+    ? 'Pick the action button that best matches the GOAL. If none match, close the modal and try a different approach.'
+    : `Your ONLY next action is to close it: ${scan.modal.closeLocator ? `await ${scan.modal.closeLocator}.click();` : 'await page.keyboard.press("Escape");'}`
+}`
             : null;
 
         return `You are a Playwright test automation agent. You control a live browser step-by-step.

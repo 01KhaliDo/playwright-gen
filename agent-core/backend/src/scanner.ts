@@ -89,6 +89,7 @@ export interface ModalInfo {
     detected: boolean;
     title: string | null;
     closeLocator: string | null;
+    actionButtons: { text: string; locator: string }[];
 }
 
 export interface ScanResult {
@@ -216,7 +217,7 @@ export class ScannerService {
             headings: [],
             accessibilityNodes: [],
             errorMessages: [],
-            modal: { detected: false, title: null, closeLocator: null },
+            modal: { detected: false, title: null, closeLocator: null, actionButtons: [] },
             scannedAt: new Date().toISOString(),
         };
 
@@ -636,7 +637,23 @@ export class ScannerService {
                 }
             }
 
-            return { detected: true, title, closeLocator };
+            // Find action buttons (non-close) inside the modal
+            const actionButtons: { text: string; locator: string }[] = [];
+            (Array.from(modalEl.querySelectorAll('button, [role="button"]')) as HTMLElement[]).forEach(btn => {
+                if (!isVisible(btn)) return;
+                const al = btn.getAttribute('aria-label') || '';
+                const text = btn.textContent?.trim() || '';
+                const cls = (typeof btn.className === 'string') ? btn.className : '';
+                if (al.toLowerCase().includes('close') || al.toLowerCase().includes('stäng')) return;
+                if (cls.includes('close') || cls.includes('dismiss') || cls.includes('btn-close')) return;
+                if (text === '×' || text === '✕' || text === '' || text.length > 80) return;
+                const locator = al
+                    ? `page.locator('${modalSelector}').getByRole('button', { name: '${al}' })`
+                    : `page.locator('${modalSelector}').getByRole('button', { name: '${text}' })`;
+                actionButtons.push({ text: text || al, locator });
+            });
+
+            return { detected: true, title, closeLocator, actionButtons };
         });
     }
 

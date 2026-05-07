@@ -65,14 +65,10 @@ app.post('/api/run-test', async (req, res) => {
     // Config som vanlig JS, undviker att ts-node-dev triggas
     const resultsJson = path.join(tmpDir, 'results.json').replace(/\\/g, '\\\\');
     const testDir = tmpDir.replace(/\\/g, '\\\\');
-    const authFile = path.join(__dirname, '..', 'auth.json');
-    const authLine = fs.existsSync(authFile)
-        ? `storageState: '${authFile.replace(/\\/g, '\\\\')}',`
-        : '';
     const configContent = `module.exports = {
   testDir: '${testDir}',
   timeout: 120000,
-  use: { ignoreHTTPSErrors: true, headless: false, slowMo: 800, ${authLine} },
+  use: { ignoreHTTPSErrors: true, headless: false, slowMo: 800 },
   reporter: [['list'], ['json', { outputFile: '${resultsJson}' }]],
 };
 `;
