@@ -278,10 +278,21 @@ export class TestAgentService {
         logger.info(`[TestAgent] ${'═'.repeat(50)}`);
 
         const testName = intent.replace(/'/g, '').substring(0, 80);
+
+        // Clean up codeLines: remove STEP FAILED comments and deduplicate lines
+        const seenLines = new Set<string>();
+        const cleanLines = codeLines.filter(line => {
+            if (line.trim().startsWith('// STEP FAILED') || line.trim().startsWith('// ERROR')) return false;
+            const key = line.trim();
+            if (seenLines.has(key)) return false;
+            seenLines.add(key);
+            return true;
+        });
+
         const finalCode =
             `import { test, expect } from '@playwright/test';\n\n` +
             `test('Agent generated test: ${testName}', async ({ page }) => {\n` +
-            `${codeLines.join('\n')}\n` +
+            `${cleanLines.join('\n')}\n` +
             `});`;
 
         const validation = TestValidatorService.validate(finalCode);
